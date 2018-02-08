@@ -1,0 +1,976 @@
+---
+title: "Enough Bioconductor to be dangerous"
+author: "Andrew McDavid"
+date: '`r Sys.Date()`'
+output:
+  slidy_presentation: default
+  beamer_presentation: default  
+extensions: inline_footnotes
+bibliography: "lecture7-enough-bioconductor-to-be-dangerous-ext/bibliography.bib"
+---
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+suppressPackageStartupMessages({
+    library(BiocStyle)
+    library(tidyverse)
+    library(DESeq2)
+})
+knitr::opts_chunk$set(cache = TRUE, autodep = TRUE, message = FALSE, warning = FALSE)
+```
+
+Bioconductor
+=============
+
+- [Bioconductor](http://www.bioconductor.org) is an open source, open development software project to provide tools for the analysis and comprehension of high-throughput genomic data.
+
+- Most Bioconductor components are distributed as R packages. The functional scope of Bioconductor packages includes the analysis of DNA microarray, sequence, flow, SNP, and other data.
+
+- Statistical and computational methods and **data**: interfaces to PubMed, annotation data from Entrez genes, experiments from ArrayExpress, GEO and the SRA.
+
+- Thousands of packages.  There are methods, experimental and annotation data.  Take a look: http://bioconductor.org/packages/release/BiocViews.html
+
+- The following is adapted from the [Bioconductor RNA-seq workflow](http://bioconductor.org/help/workflows/rnaseqGene/) by Mike Love, Simon Anders and Vladislav Kim.
+
+Sequence data
+==============
+
+Sequence data are often passed around in text files called FASTQ. There seems not to be a formal specification for them, but here's an example:
+<pre>
+@SEQ_ID
+GATTTGGGGTTCAAAGCAGTATCGATCAAATAGTAAATCCATTTGTTCAACTCACAGTTT
++
+!''*((((***+))%%%++)(%%%%).1***-+*''))**55CCF>>>>>>CCCCCCC65
+</pre>
+
+The first line is an identifier, the next line gives the sequence, the third line is a spacer, the last line gives the *qualities* using an ASCII encoding.  Illumina uses the ASCII character code minus 64.  Qualities reflect minus log odds of an error: higher qualities indicate higher confidence that a given base is correct.
+
+ Each **read** of the sequencer is represented by four lines, so FASTQ files can be many millions of lines long.
+
+The **aligner** (program that maps raw sequences to locations in a reference genome) uses FASTQ files.
+
+Binary formats
+=================
+
+A common binary format for aligned data is the **bam** (binary alignment format).  This gives the genomic locations that could have potentially generated a read, and their probabilities.  These can be used by **read counting** algorithms to estimate the number of reads that came from a gene, an ingredient for determining the expression of the gene.
+
+
+```{r dir}
+indir <- system.file("extdata", package="airway", mustWork=TRUE)
+```
+
+In this directory, we find the eight BAM files (and some other files):
+
+```{r list.files}
+list.files(indir)
+```
+
+Sample table
+==============
+
+Typically, we have a table with detailed information for each of our
+samples that links samples to the associated FASTQ and BAM files.
+For your own project, you might create such a comma-separated
+value (CSV) file using a text editor or spreadsheet software such as Excel.
+
+We load such a CSV file with *read.csv*:
+
+```{r sampleTable}
+csvfile <- file.path(indir, "sample_table.csv")
+sampleTable <- read.csv(csvfile, row.names = 1)
+sampleTable
+```
+
+Once the reads have been aligned, there are a number of tools that
+can be used to count the number of reads/fragments that can be
+assigned to genomic features for each sample. These often take as
+input SAM/BAM alignment files and a file specifying the genomic
+features, e.g. a GFF3 or GTF file specifying the gene models.
+
+
+Gene models
+=============
+Regardless of the method of quantitation, we will need a gene model. This is a mapping between transcripts/isoforms and base-pair locations in the genome.
+
+These are often provided as [GTF files](http://www.ensembl.org/info/website/upload/gff.html) [@Flicek2014Ensembl], and can be read 
+using *makeTxDbFromGFF* from the `r Biocpkg("GenomicFeatures")` package.
+GTF files can be downloaded from
+[Ensembl's FTP site](http://www.ensembl.org/info/data/ftp/) or other gene model repositories.
+A *TxDb* object is a database that can be used to
+generate a variety of range-based objects, such as exons, transcripts,
+and genes. We want to make a list of exons grouped by gene for
+counting read/fragments.
+
+There are other options for constructing a *TxDb*.
+For the *known genes* track from the UCSC Genome Browser [@Kent2002Human],
+one can use the pre-built Transcript Database:
+`r Biocannopkg("TxDb.Hsapiens.UCSC.hg19.knownGene")`.
+If the annotation file is accessible from
+`r Biocpkg("AnnotationHub")` (as is the case for the Ensembl genes),
+a pre-scanned GTF file can be imported using *makeTxDbFromGRanges*.
+
+Here we will demonstrate loading from a GTF file:
+
+```{r genfeat}
+library("GenomicFeatures")
+```
+
+We indicate that none of our sequences (chromosomes) are circular
+using a 0-length character vector.
+
+```{r txdb}
+gtffile <- file.path(indir,"Homo_sapiens.GRCh37.75_subset.gtf")
+txdb <- makeTxDbFromGFF(gtffile, format = "gtf", circ_seqs = character())
+txdb
+```
+
+The following line produces a *GRangesList* of all the exons grouped
+by gene [@Lawrence2013Software]. Each element of the list is a
+*GRanges* object of the exons for a gene.
+
+```{r}
+ebg <- exonsBy(txdb, by="gene")
+ebg
+```
+
+
+
+Counting reads
+===========
+
+![Feature counting with a "union" gene model](lecture7-enough-bioconductor-to-be-dangerous-figure/feature_counting.png)
+
+Each of scenario 1-5 would result in one count for gene_A. The total number of counts depends on:
+1. The number of cDNA fragments that came from gene_A.  Longer genes tend to produce more fragments.
+2. How easy it is to map them to gene_A.  Genes with many homologs will tend to be harder to map.
+3. How deeply we sequenced.
+
+## What the FPKM?^[See Harold Pimentel's (excellent blog post)[https://haroldpimentel.wordpress.com/2014/05/08/what-the-fpkm-a-review-rna-seq-expression-units/] for more.]
+
+Let $X_{i}$ represent the number of **counts** generated by some feature $i$.  Because of mapping uncertainty, we don't directly observe $X_i$, but can use some estimate, such as $E(X_i)$.
+
+## Counts per million (CPM)
+
+We might try to control for (3) by scaling by the total number of reads, and multiplying by one million (so we aren't dealing with tiny fractions).  This gives us **counts per million** (CPM):
+$$
+\text{CPM}_i = 10^6 X_i/N,
+$$
+where $N = sum_i X_i$.
+
+Feature $i$ has some **effective length** $l_i$.  It is *effective* because the far ends of a transcript typically can't produce a sequence-able fragment due to size selection steps in the protocols.
+
+## Transcripts per million (TPM)
+
+Longer features generate more counts, so scale each count by the effective length of the transcript, which gives us counts per basepair: $X_i/l_i$.  Then if we normalize by the total number of counts per basepair, and multiply by $10^6$ we get **transcripts per million** (TPM)
+$$
+\text{TPM}_i = \frac{X_i/l_i}{\sum_i X_i/l_i} 10^6.
+$$
+Transcripts per million is actually trying to directly estimate the relative abundances of various transcripts.  It says if you started with 1 million transcripts of varying lengths, how many of a given species would you expect to see?
+
+
+## Fragments per kilobase per million reads
+
+Finally, sometimes reads are reported as **fragments per kilobase per million** (FPKM).  In symbols
+$$
+\text{FPKM}_i = \frac{X_i}{l_i/10^3 \times N/10^6} = \frac{X_i/l_i}{N} 10^9.
+$$
+This is analogous to TPM, but with another factor of $10^3$ and with a denominator that doesn't account for the differing emission probabilities of other transcripts.
+
+**All of these are only appropriate for within-sample normalization.**
+
+But you really shouldn't just count reads
+==================
+
+![Statistical models for RNAseq are faster, and more accurate than read counting](lecture7-enough-bioconductor-to-be-dangerous-figure/patro-sailfish-fig2.png)
+
+From Patro, Mount and Kingsford (2014).
+
+Across sample normalization^[Again, see https://haroldpimentel.wordpress.com/category/statistics-2/]
+============
+
+**Normalization** is a crucial step when analyzing RNAseq and microarray data.
+
+In the case of RNAseq, we are adjusting for:
+
+- Amount/concentration of starting material
+- Sequencing depth
+- Gene length
+
+![A hypothetical gene expression experiment from Harold Pimentel's [excellent blog](https://haroldpimentel.wordpress.com/category/statistics-2/).](https://haroldpimentel.files.wordpress.com/2014/12/pie_charts.png?w=1128&h=564)
+
+
+
+Suppose each of these genes is a kilobase in effective length, so that CPM = TPM = RPKM.  The control experimental has 10 reads sequenced, while the treatment has 100.  In terms of counts:
+
+Gene | Control | Treatment
+-----|--------|----------
+G1 | 2 | 6
+G2 | 2 | 6
+G3 | 2 | 6
+G4 | 2 | 6
+FG | 2 | 76
+
+In terms of fractions:
+
+Gene | Control | Treatment
+-----|--------|----------
+G1 | .2 | .06
+G2 | .2 | .06
+G3 | .2 | .06
+G4 | .2 | .06
+FG | .2 | .76
+
+It seems that most of the genes did not change expression.  Instead, we should have omitted the Funky Gene from the scaling factor.  Between-sample normalization methods are ways to attempt to estimate the set of non-funky genes.
+
+
+Normalization - TMM
+===============
+The  Trimmed Mean of M-values (TMM) method of Robinson & Oshlack is one of the most typically used methods.  By default, the packages `edgeR` and `Limma` use the TMM normalization strategy.  `DESeq2` also employs a robust estimate (the median).
+
+<img src="Images/TMM-motivation.png" width=800>
+
+<img src="Images/TMM-formula.png" width=800>
+
+A trimmed mean is the average after removing the upper and lower x% of the data. The TMM procedure is doubly trimmed, by trimming both the M and A values. By default, they propose to trim the Mg values by 30% and the Ag values by 5%.  $G^*$ is the set of non-trimmed genes and $w^r_{gk}$ are weights, putting higher weight on genes with higher expression (hence lower log-variance).
+
+
+Importing quantitated RNAseq data
+====================
+
+The following tools can be used generate count matrices:
+*summarizeOverlaps* [@Lawrence2013Software],
+*featureCounts* [@Liao2014FeatureCounts],
+*tximport* [@Soneson2015Differential] (my recommendation),
+*htseq-count* [@Anders2015HTSeqa].
+
+function            | package                                              | framework      | output                 | *DESeq2* input function
+--------------------|------------------------------------------------------|----------------|------------------------|-------------------------
+*summarizeOverlaps* | `r Biocpkg("GenomicAlignments")`                     | R/Bioconductor | *SummarizedExperiment* | *DESeqDataSet*
+*featureCounts*     | `r Biocpkg("Rsubread")`                              | R/Bioconductor | matrix                 | *DESeqDataSetFromMatrix*
+*tximport*          | `r Biocpkg("tximport")`                              | R/Bioconductor | list of matrices       | *DESeqDataSetFromTximport*
+*htseq-count*       | [HTSeq](http://www-huber.embl.de/users/anders/HTSeq) | Python         | files                  | *DESeqDataSetFromHTSeq* 
+
+
+SummarizedExperiment objects
+==========
+
+After all this, we will try to produce a `SummarizedExperiment` object that packages an expression matrix with information about the rows and columns of said matrix.
+
+```{r}
+library(airway)
+data("airway")
+se <- airway
+```
+
+
+```{r sumexp, echo=FALSE}
+par(mar=c(0,0,0,0))
+plot(1,1,xlim=c(0,100),ylim=c(0,100),bty="n",
+     type="n",xlab="",ylab="",xaxt="n",yaxt="n")
+polygon(c(45,90,90,45),c(5,5,70,70),col="pink",border=NA)
+polygon(c(45,90,90,45),c(68,68,70,70),col="pink3",border=NA)
+text(67.5,40,"assay")
+text(67.5,35,'e.g. "counts"')
+polygon(c(10,40,40,10),c(5,5,70,70),col="skyblue",border=NA)
+polygon(c(10,40,40,10),c(68,68,70,70),col="skyblue3",border=NA)
+text(25,40,"rowRanges")
+polygon(c(45,90,90,45),c(75,75,95,95),col="palegreen",border=NA)
+polygon(c(45,47,47,45),c(75,75,95,95),col="palegreen3",border=NA)
+text(67.5,85,"colData")
+```
+
+- `assay`: (pink) matrix of counts
+- `rowRanges` (blue) information about the genomic ranges
+- `colData` (green block) samples. 
+
+Example
+=========
+
+```{r}
+se
+dim(se)
+assayNames(se)
+head(assay(se), 3)
+colSums(assay(se))
+```
+
+The `rowRanges`, when printed, only shows the first *GRanges*, and tells us
+there are `r nrow(se)` elements.
+
+```{r}
+rowRanges(se)
+```
+
+The `colData`:
+
+```{r}
+colData(se)
+```
+
+Assignment, subseting
+=============
+
+Again, we want to specify that `untrt` is the reference level for the
+dex variable:
+
+```{r}
+se$dex = se$dex %>% relevel("untrt")
+se$dex
+```
+
+We can quickly check the millions of fragments that uniquely aligned
+to the genes (the second argument of *round* tells how many decimal
+points to keep).
+
+```{r}
+round( colSums(assay(se)) / 1e6, 1 )
+```
+
+## Subsampling
+
+If we wanted to take a subsample of genes (perhaps prior to testing a slow machine learning technique, **cough**)
+```{r}
+se_samp = se[sample(nrow(se), 1000),]
+dim(se_samp)
+```
+
+This samples 1000 genes without replacement.  
+Q: How could you take only the 1000 most variable genes?
+
+Differential expression
+==============
+
+Our next goal is to test for differential expression, given conditions 1 and 2, test if
+$$
+H_0: \mu_{i1} = \mu_{i2}.
+$$
+where eg $\mu_{i1} = E(Y_{ij} | \text{condition 1})$.  Thus we have one test per gene, so ~64,000 tests.
+
+
+A cornucopia of differential expression methods
+==============
+
+There are quite a few Bioconductor packages for exploration and
+differential expression of the count data, including:
+
+- `r Biocpkg("edgeR")` [@Robinson2009EdgeR],
+- `r Biocpkg("limma")` with the voom method (my favorite) [@Law2014Voom],
+- `r Biocpkg("DSS")` [@Wu2013New],
+- `r Biocpkg("EBSeq")` [@Leng2013EBSeq] and
+- `r Biocpkg("baySeq")` [@Hardcastle2010BaySeq].
+
+@Schurch2016How
+[compared performance](https://www.ncbi.nlm.nih.gov/pmc/articles/pmid/27022035/) 
+of different statistical methods
+can provide guidance on power calculations.
+
+
+Negative binomial models
+============
+
+A common model for RNAseq (Robinson and Smyth [2007,2008]) is:
+$$
+Y_{ij}=\mathrm{NegBinom}(w_{ij}N_{j}, \phi)
+$$
+
+where $w_{ij}$ is the normalized rate of emission of gene $i$ in sample $j$, and $N_{j}$ is the total read count for sample $j$. $N_{j}$ basically accounts for sequencing depth variability from sample-to-sample. $\phi$ is the dispersion parameter. 
+
+The following parametrization is often of use: 
+$$\mathbb{E}(Y_{ij})=\mu_{ij}\quad \mathrm{and}\quad \mathrm{Var}(Y_{ij})=\mu_{ij}(1+\mu_{ij}\phi)$$
+
+where $\mu_{ij}=w_{ij}N_{j}$. In this parametrization the Poisson distribution can be seen as a special case when $\phi=0$.
+
+
+## Estimation
+
+The genewise dispersion parameters are estimated by conditional maximum likelihood, conditioning on the total count for that gene (Smyth and Verbyla, 1996). An empirical Bayes procedure is used to shrink the dispersions towards a consensus value, effectively borrowing information between genes (Robinson and Smyth, 2007).
+
+
+
+
+Containers for DESeq2
+===========
+
+Bioconductor software packages often define and use a custom class for
+storing data: *DESeq2* uses a *DESeqDataSet*. It is built on
+top of the *SummarizedExperiment* class, with a few minor constraints enforced. 
+
+For instance, the *DESeqDataSet* has an associated
+*design formula* specified at the
+beginning of the analysis, informing many of the *DESeq2*
+functions how to treat the samples in the analysis
+
+For the airway experiment, we will specify `~ cell + dex`
+meaning that we want to test for the effect of dexamethasone (`dex`)
+controlling for the effect of different cell line (`cell`). We can see
+each of the columns just using the `$` directly on the
+*SummarizedExperiment* or *DESeqDataSet*:
+
+```{r secell}
+se$cell
+se$dex
+dds <- DESeqDataSet(se, design = ~ cell + dex)
+
+```
+
+DESeq2 differential expression pipeline
+================
+
+As we have already specified an experimental design when we created
+the *DESeqDataSet*, we can run the differential expression pipeline on
+the raw counts with a single call to the function *DESeq*:
+
+```{r airwayDE}
+dds <- DESeq(dds)
+```
+
+This function will print out a message for the various steps it
+performs. These are described in more detail in the manual page for
+*DESeq*, which can be accessed by typing `?DESeq`. Briefly these are:
+the estimation of size factors (controlling for differences in the
+sequencing depth of the samples), the estimation of
+dispersion values for each gene, and fitting a generalized linear model.
+
+A *DESeqDataSet* is returned that contains all the fitted
+parameters within it, and the following section describes how to
+extract out results tables of interest from this object.
+
+Building the results table
+=================
+
+Calling *results* without any arguments will extract the estimated
+log2 fold changes and *p* values for the last variable in the design
+formula. If there are more than 2 levels for this variable, *results*
+will extract the results table for a comparison of the last level over
+the first level. The comparison is printed at the top of the output:
+`dex trt vs untrt`.
+
+```{r}
+res <- results(dds)
+res
+```
+
+We could have equivalently produced this results table with the
+following more specific command. Because `dex` is the last variable in
+the design, we could optionally leave off the `contrast` argument to extract
+the comparison of the two levels of `dex`.
+
+```{r}
+res <- results(dds, contrast=c("dex","trt","untrt"))
+```
+
+Interpreting results
+============
+
+`res` is a *DataFrame* object and helpfully carries metadata
+with information on the meaning of the columns:
+
+```{r}
+mcols(res, use.names = TRUE)
+```
+
+- `baseMean`, average of the normalized
+count values, divided by the size factors, taken over all samples in the
+*DESeqDataSet*.
+- `log2FoldChange` is the effect size estimate. It tells us
+how much the gene's expression seems to have changed due to treatment
+with dexamethasone in comparison to untreated samples.  This value is
+reported on a logarithmic scale to base 2: for example, a log2 fold
+change of 1.5 means that the gene's expression is increased by a
+multiplicative factor of \(2^{1.5} \approx 2.82\).
+- `lfcSE`, the standard error estimate for
+the log2 fold change estimate.  
+-  `pvalue` *hypothesis test* against the *null hypothesis* that there is zero effect of the treatment
+
+## Quick summary
+
+We can also summarize the results with the following line of code,
+which reports some additional information, that will be covered in
+later sections.
+
+```{r}
+summary(res)
+```
+
+Note that there are many genes with differential expression due to
+dexamethasone treatment at the FDR level of 10%. This makes sense, as
+the smooth muscle cells of the airway are known to react to
+glucocorticoid steroids. 
+
+How could we provide a prioritized list of genes by effect size?
+
+
+## NA values
+When all counts for
+a gene were zero, or if the gene was excluded from analysis
+because it contained an extreme count outlier. 
+
+Other comparisons
+=============
+
+In general, the results for a comparison of any two levels of a
+variable can be extracted using the `contrast` argument to
+*results*. The user should specify three values: the name of the
+variable, the name of the level for the numerator, and the name of the
+level for the denominator. Here we extract results for the log2 of the
+fold change of one cell line over another:
+
+```{r}
+results(dds, contrast = c("cell", "N061011", "N61311"))
+```
+
+There are additional ways to build results tables for certain
+comparisons after running *DESeq* once.
+If results for an interaction term are desired, the `name`
+argument of *results* should be used. Please see the 
+help page for the *results* function for details on the additional
+ways to build results tables. In particular, the **Examples** section of
+the help page for *results* gives some pertinent examples.
+
+Multiple testing
+===============
+
+In high-throughput biology, we are careful to not use the *p* values
+directly as evidence against the null, but to correct for
+*multiple testing*. What would happen if we were to simply threshold
+the *p* values at a low value, say 0.05? There are
+`r sum(res$pvalue < .05, na.rm=TRUE)` genes with a *p* value
+below 0.05 among the `r sum(!is.na(res$pvalue))` genes for which the
+test succeeded in reporting a *p* value:
+
+```{r sumres}
+sum(res$pvalue < 0.05, na.rm=TRUE)
+sum(!is.na(res$pvalue))
+```
+
+Now, assume for a moment that the null hypothesis is true for all
+genes, i.e., no gene is affected by the treatment with
+dexamethasone. Then, by the definition of the *p* value, we expect up to
+5% of the genes to have a *p* value below 0.05. This amounts to
+`r round(sum(!is.na(res$pvalue)) * .05 )` genes.
+If we just considered the list of genes with a *p* value below 0.05 as
+differentially expressed, this list should therefore be expected to
+contain up to
+`r round(sum(!is.na(res$pvalue)) * .05)` /
+`r sum(res$pvalue < .05, na.rm=TRUE)` =
+`r round(sum(!is.na(res$pvalue))*.05 / sum(res$pvalue < .05, na.rm=TRUE) * 100)`%
+ false positives.
+
+*DESeq2* uses the Benjamini-Hochberg (BH) adjustment [@Benjamini1995Controlling] as implemented in
+the base R *p.adjust* function; in brief, this method calculates for
+each gene an adjusted *p* value that answers the following question:
+if one called significant all genes with an adjusted *p* value less than or
+equal to this gene's adjusted *p* value threshold, what would be the fraction
+of false positives (the *false discovery rate*, FDR) among them, in
+the sense of the calculation outlined above? These values, called the
+BH-adjusted *p* values, are given in the column `padj` of the `res`
+object.
+
+The FDR is a useful statistic for many high-throughput
+experiments, as we are often interested in reporting or focusing on a
+set of interesting genes, and we would like to put an upper bound on the
+percent of false positives in this set. 
+
+Hence, if we consider a fraction of 10% false positives acceptable,
+we can consider all genes with an adjusted *p* value below 10% = 0.1
+as significant. How many such genes are there?
+
+```{r}
+sum(res$padj < 0.1, na.rm=TRUE)
+```
+
+We subset the results table to these genes and then sort it by the
+log2 fold change estimate to get the significant genes with the
+strongest down-regulation:
+
+```{r}
+resSig <- subset(res, padj < 0.1)
+head(resSig[ order(resSig$log2FoldChange), ])
+```
+
+...and with the strongest up-regulation:
+
+```{r}
+head(resSig[ order(resSig$log2FoldChange, decreasing = TRUE), ])
+```
+
+<a id="plots"></a>
+
+# Plotting results
+
+## Counts plot
+
+A quick way to visualize the counts for a particular gene is to use
+the *plotCounts* function that takes as arguments the
+*DESeqDataSet*, a gene name, and the group over which to plot the
+counts (figure below).
+
+```{r plotcounts}
+topGene <- rownames(res)[which.min(res$padj)]
+library("ggbeeswarm")
+geneCounts <- plotCounts(dds, gene = topGene, intgroup = c("dex","cell"),
+                         returnData = TRUE)
+ggplot(geneCounts, aes(x = dex, y = count, color = cell, group = cell)) +
+  scale_y_log10() + geom_point(size = 3) + geom_line()
+```
+
+**Normalized counts with lines connecting cell lines.**
+Based on this figure, would you conclude there is evidence of an interaction between cellline and treatment?
+
+
+
+
+Exploratory analysis and visualization
+===================
+
+Next we will consider *transformations of the counts*
+in order to visually explore sample relationships.
+
+## Pre-filtering the dataset
+
+Our count matrix with our *DESeqDataSet* contains many rows with only
+zeros, and additionally many rows with only a few fragments total. In
+order to reduce the size of the object, and to increase the speed of
+our functions, we can remove the rows that have no or nearly no
+information about the amount of gene expression.  Here we apply the
+most minimal filtering rule: removing rows of the *DESeqDataSet* that
+have no counts, or only a single count across all samples. Additional
+weighting/filtering to improve power is applied at a later step in the
+workflow. 
+
+```{r}
+nrow(dds)
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+nrow(dds)
+```
+
+Variance stabilizing transformations
+============
+
+Many common statistical methods for exploratory analysis of
+multidimensional data, for example clustering and *principal
+components analysis* (PCA), work best for data that generally has the
+same range of variance at different ranges of the mean values:  *homoskedastic*. 
+We can quickly show this property of counts with some simulated
+data (here, Poisson counts with a range of lambda from 0.1 to 100).
+We plot the standard deviation of each row (genes) against the mean:
+
+```{r meanSdCts}
+lambda <- 10^seq(from = -1, to = 2, length = 1000)
+cts <- matrix(rpois(1000*100, lambda), ncol = 100)
+library("vsn")
+meanSdPlot(cts, ranks = FALSE)
+```
+
+And for logarithm-transformed counts:
+
+```{r meanSdLogCts}
+log.cts.one <- log2(cts + 1)
+meanSdPlot(log.cts.one, ranks = FALSE)
+```
+
+The logarithm with a small pseudocount amplifies differences when the
+values are close to 0. The low count genes with low signal-to-noise
+ratio will overly contribute to sample-sample distances and PCA
+plots. 
+
+*DESeq2* offers two transformations for count data that
+stabilize the variance across the mean.  I recommend the
+and the *variance stabilizing transformation* implemented in the `vst` function. The VST is much faster to compute and is less
+sensitive to high count outliers than the other approach the regularized log (`rlog`).
+The function `vst` returns an object based on the *SummarizedExperiment*
+class that contains the stabilized values in its *assay* slot.
+
+```{r vst}
+vsd <- vst(dds, blind = FALSE)
+head(assay(vsd), 3)
+```
+
+ `blind = FALSE` regresses out variability due to experiment factors before estimating the mean-variance trend.  For a fully *unsupervised* transformation, set
+`blind = TRUE` (which is the default).
+
+
+The `rlog` transformation has a similar API to `vst`.
+```{r rlog}
+rld <- rlog(dds, blind = FALSE)
+head(assay(rld), 3)
+```
+
+
+
+Sample distances
+================
+
+A useful first step in an RNA-seq analysis is often to assess overall
+similarity between samples: Which samples are similar to each other,
+which are different? Does this fit to the expectation from the
+experiment's design?
+
+We use the R function *dist* to calculate the Euclidean distance
+between samples. To ensure we have a roughly equal contribution from
+all genes, we use it on the rlog-transformed data. We need to
+transpose the matrix of values using *t*, because the *dist* function
+expects the different samples to be rows of its argument, and
+different dimensions (here, genes) to be columns.
+
+```{r}
+sampleDists <- dist(t(assay(rld)))
+sampleDists
+```
+
+What classifier have we learned about that would make immediate use of this matrix?
+
+
+
+```{r}
+
+```
+
+If we don't provide `sampleDists` to the `clustering_distance`
+argument of the *pheatmap* function, it would calculate distances between the
+rows/columns of the distance matrix, which is kind of non-sense.
+
+```{r distheatmap, fig.width = 6.1, fig.height = 4.5}
+library("pheatmap")
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- paste( rld$dex, rld$cell, sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+```
+
+
+PCA
+=============
+
+```{r plotpca, fig.width=6, fig.height=4.5}
+plotPCA(rld, intgroup = c("dex"))
+plotPCA(rld, intgroup = c("cell"))
+```
+
+**PCA plot using the rlog-transformed values.** Each unique combination of
+treatment and cell line is given its own color.
+
+- What do the percentages mean?
+
+MDS plots
+============
+
+*multidimensional scaling* (MDS) is similar to PCA (in fact classic Torgerson MDS it is just doing PCA on a distance matrix).  This is useful when we don't have a matrix of data, but only a matrix of distances. Here we
+compute the MDS for the distances calculated from the *rlog*
+transformed counts and plot these in a figure below.
+
+```{r mdsrlog, fig.width=6, fig.height=4.5}
+mds <- as.data.frame(colData(rld))  %>%
+         cbind(cmdscale(sampleDistMatrix))
+ggplot(mds, aes(x = `1`, y = `2`, color = dex, shape = cell)) +
+  geom_point(size = 3) + coord_fixed()
+```
+
+**MDS plot using rlog-transformed values.**
+
+However, there are a number of extensions of MDS beyond the classical algorithm that are no longer equivalent to PCA, so the notion of reconstructing a dissimilarity matrix in 2D is a useful one.
+
+The canonical heatmap
+===============
+
+In the sample distance heatmap made previously, the dendrogram at the
+side shows us a hierarchical clustering of the samples. Such a
+clustering can also be performed for the genes.  Since the clustering
+is only relevant for genes that actually carry a signal, one usually
+would only cluster a subset of the most highly variable genes. Here,
+for demonstration, let us select the 20 genes with the highest
+variance across samples. We will work with the *rlog* transformed
+counts:
+
+```{r}
+library("genefilter")
+topVarGenes <- head(order(rowVars(assay(rld)), decreasing = TRUE), 20)
+```
+
+We center each genes' values across samples,
+and plot a heatmap (figure below). Centering both makes the color scheme more interpretable and alters the distance calculation, hence clustering, generally for the better.  We provide a *data.frame* that instructs the
+*pheatmap* function how to label the columns.
+
+```{r genescluster}
+mat  <- assay(rld)[ topVarGenes, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(rld)[, c("cell","dex")])
+pheatmap(mat, annotation_col = anno)
+```
+
+**Heatmap of relative rlog-transformed values across samples.**
+
+
+# Batch effects
+
+Batch effects are a fact of life in high-throughput biology because of the complex dependence of steps in an experiment.  Consider the microarray:
+
+1.  Get cDNA (how degraded is your sample, how pure is your cell or tissue type)
+2.  Hybridize: concentration, temperature, time
+3.  Wash: time, temperature, astringency
+4.  Chip effects -- lot.
+
+Although variation in each step ought to be minimized, they are not a sin, but rather an unavoidable source of variability.  Blocking, randomization and replication is the only solution.  Fortunately, it is a powerful solution!
+
+
+
+# Minimizing batch effects
+
+The discussion on variance stabilizing transformations and normalization provides some analytic tools to minimize batch effects.  Good experimental technique provides biological ways to minimize batch effects.
+
+Unfortunately, these techniques will not always correct for batch effects. Technical variation due to batch effects might only affect a subset of the genes.
+
+<img src="http://www.nature.com/nrg/journal/v11/n10/images/nrg2825-f1.jpg" width=300>
+
+"For a published bladder cancer microarray data set obtained using an Affymetrix platform, we obtained the raw data for only the normal samples. Here, green and orange represent two different processing dates."
+
+
+
+# Adjusting for batch effects
+
+**Two scenarios:**
+
+1. You have information about the batch variable
+    - Use your batch effect as a covariate in your analysis (e.g. limma or ComBat).
+2. You suspect a batch effect, but you don't know where it is coming from
+    - The batch effect needs to be estimated first and then corrected for, by adding the estimated variables as co-variates
+
+
+# Singular value decomposition
+
+Let $X$ be a matrix of size $m\times n$ ($m \ge n$) and rank $r\le n$
+then we can decompose $X$ as 
+
+$$X=UDV^T$$
+
+- U is the matrix of left singular vectors (eigenassays)
+- V is the matrix of right singular vectors (eigengenes)
+- D is the matrix of singular values (eigenvalues)
+
+$U^TU=VV^T=I$ (orthogonal vectors)
+
+
+$D=diag(d_1, \dots, d_n)$ where $d_l\ge 0$ and $d_{r+1}=\dots=d_n=0$
+
+$X_i=\sum_j u_{ij}d_j\mathbf{v}_j$, which can be interpreted as a change of coordinate
+
+## Relationship to principale component analysis
+
+$X=UDV^T$, and we have $X^TX=VDU^TUDV^T=VD^2V^T$
+
+What happens if the rows of X are scaled?
+
+
+# Surrogate variable analysis
+
+Let $X_{m\times n}=(x_1,..,x_m)^T$ be the matrix of normalized expression values, with $n$ arrays and $m$ genes. 
+Let $y=(y_1,..,y_n)^T$ be a vector of length $n$ representing the primary variable of interest (e.g covariates, vector of unknown coefficients). Without loss of generality model $x_{ij}=\mu_i+f_i( y_j) + e_{ij}$, where $\mu_i$ is the baseline level of expression, $f_i(y_j)=\mathbb{E}(x_{ij} | y_j)-\mu_i$ gives the relationship between measured variable of interest and gene $i$, and $e_{ij}$ is random noise with mean zero.
+
+Suppose there are $L$ biologically meaningful unmodeled factors, such as age, environmental exposure, genotype,
+etc. Let $\mathbf{G} = (g_{l1},...,g_{ln})$ be a set of factors across all $n$ arrays, for $l=1,2,...,L$. Our model becomes:
+
+$$x_{ij}=\mu_i + f_i(y_j) + \boldsymbol{\Gamma} \mathbf{G} + e^*_{ij},$$
+where $\boldsymbol{\Gamma}$ is $m \times L$ and  $\mathbf{G}$ is $L \times n$.  
+
+Leek and Storey propose to use singular value decomposition to approximate
+ $\boldsymbol{\Gamma} \mathbf{G}$. Computationally, this is done in two steps:
+
+
+1. Detect unmodeled factors
+2. Construct surrogate variables
+
+# Detect unmodeled factors
+  
+The main idea is as follows:
+
+- Compute the residual matrix $r_{ij} = x_{ij}- \hat{\mu}_i - \hat{f}_i(y_j)$
+- Perform the SVD of $R=(r_{ij})$
+- Determine the number $K$ of significant components through a permutation procedure.
+<!-- - Independently permute the rows of the matrix $R$ to obtain $R^*$. Regress  $r^*_{ij} = x_{ij}- \hat{\mu}_i - \hat{f}_i(y_j)$ to get residual matrix $R_0$, and perform the SVD of $R_0$. Repeat this many times to generate a null distribution for the residuals, given that $y$ is accounted for.  -->
+<!-- - Compare the observed eigenvalues to those generated from the null distribution to obtain significance p-values -->
+<!-- - Record the $K$ significant variables -->
+
+# Construct surrogate variables 
+
+If we used residual matrix directly, then we force the $\mathbf{G}$ eigen-factors (which Leek somewhat-confusingly calls eigengenes) to be orthogonal to the treatment variables.  But we don't want to assume the batch variables are necessarily orthogonal to treatment.  Instead, we assume that the most of the signal comes from a few genes, and take the SVD of this smaller set. It's not clear to me, exactly what statistical model, if any, this is supposed to correspond to.
+
+1. Compute the residual matrix $r_{ij} = x_{ij} - \hat{\mu}_i - \hat{f}_i(y_j)$
+2. Perform the SVD of $R=(r_{ij})$
+
+Let $e_k=(e_{k1},...,e_{kn})^T$ be the $k$-th column of $V$ (for $k=1,...,n$). These $e_k$ are the residual eigengenes and represent orthogonal residual signals independent of the signal due to the primary variable.
+
+2. Regress $e_k$ on the $x_i$ to access the significance of the $k$-th factor on gene $i$
+3. Use the selected genes to form a reduced expression matrix and repeat 1. The estimated factor will form the basis for the surrogate variables
+4. In any subsequent analysis include these factors in your model
+
+# Using the sva package
+
+```{r}
+library("sva")
+```
+
+
+```{r}
+dat  <- counts(dds, normalized = TRUE)
+idx  <- rowMeans(dat) > 1
+dat  <- dat[idx, ]
+mod  <- model.matrix(~ dex, colData(dds))
+mod0 <- model.matrix(~   1, colData(dds))
+svseq <- svaseq(dat, mod, mod0, n.sv = 2)
+svseq$sv
+```
+
+Do a little light filtering and set up the model.
+
+```{r svaplot}
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:2) {
+  stripchart(svseq$sv[, i] ~ dds$cell, vertical = TRUE, main = paste0("SV", i))
+  abline(h = 0)
+ }
+```
+
+**Surrogate variables 1 and 2 plotted over cell line.**
+Here, we know the hidden source of variation (cell line), and
+therefore can see how the SVA procedure is able to identify a source
+of variation which is correlated with cell line.
+
+In order to adjust for the surrogate variables, we simply add these two surrogate variables
+as columns to the *DESeqDataSet* and then add them to the design:
+
+```{r}
+ddssva <- dds
+ddssva$SV1 <- svseq$sv[,1]
+ddssva$SV2 <- svseq$sv[,2]
+design(ddssva) <- ~ SV1 + SV2 + dex
+```
+
+We could then produce results controlling for surrogate variables by
+running *DESeq* with the new design: 
+
+```{r svaDE}
+ddssva =  DESeq(ddssva)
+```
+
+Comparison to cell line known
+==============
+```{r}
+library(biobroom)
+sva_res = results(ddssva) %>% tidy()
+comparison = results(dds) %>% tidy() %>% left_join(sva_res, suffix = c('.cell', '.sva'), by = 'gene')
+ggplot(comparison, aes(x = (estimate.cell + estimate.sva)/2, y = (estimate.cell - estimate.sva))) + geom_point(aes(color = (p.adjusted.sva < .05 & p.adjusted.cell > .1)), size = .5, alpha = .5) + geom_smooth() + scale_color_discrete('DE Discordant')
+```
+
+ComBat
+=========
+
+The ComBat method of Johnson, Li and Rabinovic (2006) posits a hierarchical model for batch effects and shrinks around a common mean.  It also allows for heteroscedasticity.  See https://academic.oup.com/biostatistics/article-lookup/doi/10.1093/biostatistics/kxj037#fd2.2 for details.
+
+Bibliography
+=============
+
+
